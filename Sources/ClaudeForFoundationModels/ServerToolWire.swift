@@ -8,6 +8,7 @@ import Foundation
 // typed content, attaching results to in-flight calls, and replaying both
 // halves of the round-trip as request blocks on later turns.
 
+@available(iOS 27.0, macOS 27.0, visionOS 27.0, watchOS 27.0, *)
 extension ClaudeServerToolSegment.Content {
   /// Typed parse of a `server_tool_use` block's input. Unknown tools and
   /// undecodable inputs land in `.unrecognized` rather than being dropped.

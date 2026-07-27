@@ -22,6 +22,7 @@ import FoundationModels
 /// let session = LanguageModelSession(model: model)
 /// let response = try await session.respond(to: "Plan a 4-day trip to Buenos Aires")
 /// ```
+@available(iOS 27.0, macOS 27.0, visionOS 27.0, watchOS 27.0, *)
 public struct ClaudeLanguageModel: Sendable {
   public let model: ClaudeModel
   public let baseURL: URL
@@ -94,6 +95,7 @@ public struct ClaudeLanguageModel: Sendable {
   public static let defaultBaseURL = URL(string: "https://api.anthropic.com")!
 }
 
+@available(iOS 27.0, macOS 27.0, visionOS 27.0, watchOS 27.0, *)
 extension ClaudeLanguageModel: LanguageModel {
   public typealias Executor = ClaudeExecutor
 

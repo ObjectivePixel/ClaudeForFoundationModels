@@ -26,6 +26,10 @@ Use Claude as a server-side language model through Apple's [Foundation Models](h
 - Xcode 27 (beta).
 - A credential: an App Attest client ID from the Anthropic console, or an API key for simulator development. See [Authentication](#authentication).
 
+The package manifest supports earlier deployment targets so an app can keep
+non-AI surfaces available there. All Claude provider APIs remain explicitly
+available only on OS 27 and later.
+
 ## Installation
 
 Add the package to your `Package.swift`:

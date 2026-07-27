@@ -23,6 +23,7 @@ import FoundationModels
 ///   }
 /// }
 /// ```
+@available(iOS 27.0, macOS 27.0, visionOS 27.0, watchOS 27.0, *)
 public struct ClaudeServerToolSegment: Transcript.CustomSegment {
   public let id: String
   public let content: Content
