@@ -129,6 +129,18 @@ Set the credential with the `auth:` parameter.
 // physical device.
 ClaudeLanguageModel(name: .sonnet5, auth: .appAttest(clientID: "clid_..."))
 
+// A keyless developer broker can validate App Attest, exchange its own OIDC
+// identity through Anthropic Workload Identity Federation, and return only
+// the resulting short-lived Anthropic bearer. Prompts and responses still go
+// directly to api.anthropic.com.
+ClaudeLanguageModel(
+  name: .sonnet5,
+  auth: .appAttestBroker(
+    clientID: "wristrecall-ios",
+    credentialBaseURL: URL(string: "https://auth.example.com")!
+  )
+)
+
 // An API key is useful for simulator iteration. A bundled key is
 // extractable from a shipping app, so don't release with one.
 ClaudeLanguageModel(name: .sonnet5, auth: .apiKey("..."))
