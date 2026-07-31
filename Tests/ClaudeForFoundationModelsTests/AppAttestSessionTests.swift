@@ -53,6 +53,10 @@ import Testing
       registerJSON["attestation_object"]
         == FakeAttestation.attestationObject.base64EncodedString()
     )
+    #expect(
+      registerJSON["challenge"]
+        == "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+    )
 
     // Registration binds the attestation to SHA-256 of the raw challenge.
     #expect(
@@ -85,12 +89,15 @@ import Testing
     let form = String(decoding: tokenBody, as: UTF8.self)
     #expect(form.contains("grant_type=urn%3Aanthropic%3Aparams%3Aoauth%3Agrant-type%3Aapp-attest"))
     #expect(form.contains("client_id=clid_test"))
+    #expect(
+      form.contains("challenge=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE%3D")
+    )
     #expect(!form.contains("+"))  // base64 values must be percent-encoded
 
     // The assertion binds domain prefix ‖ challenge ‖ client_id ‖ raw key ID.
     #expect(
       attestation.assertionHashes == [
-        Data(hexString: "cdc917d0f99d66de670d66db7cfdc90b8f34be288cabe3f1bb63c1e19b2a0b23")
+        Data(hexString: "b8f6408c0f1dd519aae777c6c3968ea5f7a25d5a3f427616f86ef3ab9b2c2bcd")
       ]
     )
   }

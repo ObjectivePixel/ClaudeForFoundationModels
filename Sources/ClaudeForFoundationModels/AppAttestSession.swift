@@ -176,8 +176,15 @@ actor AppAttestSession {
 
   private var credentials = CredentialState()
   private var pacing = RecoveryPacing()
-  /// Pre-issued by the server in register/token responses; single-use.
-  private var pendingChallenge: (challenge: Data, expiresAt: ContinuousClock.Instant)?
+  private struct Challenge: Sendable {
+    let data: Data
+    let wireValue: String
+  }
+
+  /// Pre-issued by the server in register/token responses. The signed token
+  /// is stateless server-side; App Attest's key uniqueness and assertion
+  /// counter provide replay protection when it is consumed.
+  private var pendingChallenge: (challenge: Challenge, expiresAt: ContinuousClock.Instant)?
   private var refreshInFlight: Task<String, Error>?
   private var registrationInFlight: Task<String, Error>?
 
@@ -294,10 +301,10 @@ actor AppAttestSession {
 
   /// Attests the key against the challenge and registers it. The response
   /// carries the install's first bearer token.
-  private func attestAndRegister(keyID: String, challenge: Data) async throws -> StoredToken {
+  private func attestAndRegister(keyID: String, challenge: Challenge) async throws -> StoredToken {
     let attestationObject = try await attestation.attestKey(
       keyID,
-      clientDataHash: Self.registrationClientDataHash(challenge: challenge)
+      clientDataHash: Self.registrationClientDataHash(challenge: challenge.data)
     )
     let (data, status, retryAfter) = try await post(
       path: "v1/oauth/app-attest/register",
@@ -307,6 +314,7 @@ actor AppAttestSession {
           "client_id": clientID,
           "key_id": keyID,
           "attestation_object": attestationObject.base64EncodedString(),
+          "challenge": challenge.wireValue,
         ])
     )
     // Rejections are deliberately opaque server-side. The key was freshly
@@ -329,7 +337,7 @@ actor AppAttestSession {
     let assertion = try await attestation.generateAssertion(
       keyID,
       clientDataHash: Self.assertionClientDataHash(
-        challenge: challenge,
+        challenge: challenge.data,
         clientID: clientID,
         keyID: keyIDBytes
       )
@@ -343,6 +351,7 @@ actor AppAttestSession {
           "client_id": clientID,
           "key_id": keyID,
           "assertion": assertion.base64EncodedString(),
+          "challenge": challenge.wireValue,
         ])
         .utf8
       )
@@ -370,7 +379,7 @@ actor AppAttestSession {
   /// expired. A missing `expires_in` also means nearly expired, because the
   /// wire encoding omits zero values. When the TTL can't cover the signing
   /// round-trip, wait out the remainder and fetch the successor.
-  private func fetchChallenge(keyID: String) async throws -> Data {
+  private func fetchChallenge(keyID: String) async throws -> Challenge {
     // A pre-issued challenge from the last register/token response saves
     // the fetch round-trip. It is single-use, so clear it here even if it
     // turns out too stale to sign.
@@ -416,7 +425,7 @@ actor AppAttestSession {
     return token
   }
 
-  private func issueChallenge(keyID: String) async throws -> (Data, Double?) {
+  private func issueChallenge(keyID: String) async throws -> (Challenge, Double?) {
     let (data, status, retryAfter) = try await post(
       path: "v1/oauth/app-attest/challenge",
       contentType: "application/json",
@@ -439,7 +448,10 @@ actor AppAttestSession {
     else {
       throw AppAttestError.malformedResponse
     }
-    return (challenge, Self.wireDuration(response.expiresIn))
+    return (
+      Challenge(data: challenge, wireValue: response.challenge),
+      Self.wireDuration(response.expiresIn)
+    )
   }
 
   // MARK: - Bindings
@@ -450,12 +462,11 @@ actor AppAttestSession {
   }
 
   /// Token-grant binding, version-bearing via the domain prefix. The server
-  /// reconstructs these exact bytes from the stored challenge and the
-  /// request fields; fixed-length bookends (32-byte challenge and key ID)
-  /// make the variable-length client ID unambiguous.
+  /// verifies the signed challenge token, then reconstructs these exact
+  /// bytes from it and the request fields.
   static func assertionClientDataHash(challenge: Data, clientID: String, keyID: Data) -> Data {
     var hash = SHA256()
-    hash.update(data: Data("anthropic-app-attest-token-v1".utf8))
+    hash.update(data: Data("anthropic-app-attest-token-v2".utf8))
     hash.update(data: challenge)
     hash.update(data: Data(clientID.utf8))
     hash.update(data: keyID)
@@ -530,7 +541,7 @@ actor AppAttestSession {
   /// response is treated as malformed.
   private static func token(
     fromOAuthResponse data: Data
-  ) throws -> (StoredToken, (challenge: Data, expiresIn: TimeInterval)?) {
+  ) throws -> (StoredToken, (challenge: Challenge, expiresIn: TimeInterval)?) {
     struct OAuthTokenResponse: Decodable {
       let accessToken: String
       let expiresIn: Double?
@@ -557,12 +568,12 @@ actor AppAttestSession {
     )
     // These fields are optional; the server omits them when it has no
     // pre-issued challenge to offer.
-    var next: (challenge: Data, expiresIn: TimeInterval)?
+    var next: (challenge: Challenge, expiresIn: TimeInterval)?
     if let encoded = response.nextChallenge,
       let challenge = Self.decodeBase64Loose(encoded), !challenge.isEmpty,
       let ttl = wireDuration(response.nextChallengeExpiresIn), ttl > 0
     {
-      next = (challenge, ttl)
+      next = (Challenge(data: challenge, wireValue: encoded), ttl)
     }
     return (token, next)
   }
