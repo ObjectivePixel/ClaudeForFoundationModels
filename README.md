@@ -26,6 +26,10 @@ Use Claude as a server-side language model through Apple's [Foundation Models](h
 - Xcode 27 (beta).
 - A credential: an App Attest client ID from the Anthropic console, or an API key for simulator development. See [Authentication](#authentication).
 
+The package manifest supports earlier deployment targets so an app can keep
+non-AI surfaces available there. All Claude provider APIs remain explicitly
+available only on OS 27 and later.
+
 ## Installation
 
 Add the package to your `Package.swift`:
@@ -124,6 +128,18 @@ Set the credential with the `auth:` parameter.
 // developer backend. Works in development and production; requires a
 // physical device.
 ClaudeLanguageModel(name: .sonnet5, auth: .appAttest(clientID: "clid_..."))
+
+// A keyless developer broker can validate App Attest, exchange its own OIDC
+// identity through Anthropic Workload Identity Federation, and return only
+// the resulting short-lived Anthropic bearer. Prompts and responses still go
+// directly to api.anthropic.com.
+ClaudeLanguageModel(
+  name: .sonnet5,
+  auth: .appAttestBroker(
+    clientID: "example-ios-app",
+    credentialBaseURL: URL(string: "https://auth.example.com")!
+  )
+)
 
 // An API key is useful for simulator iteration. A bundled key is
 // extractable from a shipping app, so don't release with one.

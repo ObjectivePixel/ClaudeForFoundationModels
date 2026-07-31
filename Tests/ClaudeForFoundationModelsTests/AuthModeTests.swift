@@ -18,6 +18,24 @@ import Testing
     #expect(AuthMode.appAttest(clientID: "a") != AuthMode.appAttest(clientID: "b"))
   }
 
+  @Test func `brokered appAttest includes the credential host in its identity`() throws {
+    let first = try #require(URL(string: "https://auth.example.com"))
+    let second = try #require(URL(string: "https://other.example.com"))
+
+    #expect(
+      AuthMode.appAttestBroker(clientID: "a", credentialBaseURL: first)
+        == AuthMode.appAttestBroker(clientID: "a", credentialBaseURL: first)
+    )
+    #expect(
+      AuthMode.appAttestBroker(clientID: "a", credentialBaseURL: first)
+        != AuthMode.appAttestBroker(clientID: "a", credentialBaseURL: second)
+    )
+    #expect(
+      AuthMode.appAttestBroker(clientID: "a", credentialBaseURL: first)
+        != AuthMode.appAttest(clientID: "a")
+    )
+  }
+
   /// Proxy headers must participate in the executor cache key, so two models
   /// that differ only by their proxy headers get distinct cached executors.
   @Test func `proxy headers drive the executor configuration identity`() {

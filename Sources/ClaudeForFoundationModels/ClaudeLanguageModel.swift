@@ -22,6 +22,7 @@ import FoundationModels
 /// let session = LanguageModelSession(model: model)
 /// let response = try await session.respond(to: "Plan a 4-day trip to Buenos Aires")
 /// ```
+@available(iOS 27.0, macOS 27.0, visionOS 27.0, watchOS 27.0, *)
 public struct ClaudeLanguageModel: Sendable {
   public let model: ClaudeModel
   public let baseURL: URL
@@ -75,12 +76,13 @@ public struct ClaudeLanguageModel: Sendable {
     self.timeout = timeout
   }
 
-  /// Idempotent. Under ``AuthMode/appAttest(clientID:)``, performs the
+  /// Idempotent. Under ``AuthMode/appAttest(clientID:)`` or
+  /// ``AuthMode/appAttestBroker(clientID:credentialBaseURL:)``, performs the
   /// first-run device attestation so its multi-second cost and any failure
   /// surface here instead of on the first request. A no-op for every other
   /// mode.
   public func authenticateIfNeeded() async throws {
-    guard case .appAttest = authMode else { return }
+    guard authMode.appAttestConfiguration != nil else { return }
     let configuration = executorConfiguration
     do {
       guard let session = try ClaudeExecutor.makeAttestSession(for: configuration)
@@ -94,6 +96,7 @@ public struct ClaudeLanguageModel: Sendable {
   public static let defaultBaseURL = URL(string: "https://api.anthropic.com")!
 }
 
+@available(iOS 27.0, macOS 27.0, visionOS 27.0, watchOS 27.0, *)
 extension ClaudeLanguageModel: LanguageModel {
   public typealias Executor = ClaudeExecutor
 

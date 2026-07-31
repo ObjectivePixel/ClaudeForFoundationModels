@@ -47,4 +47,28 @@ public enum AuthMode: Hashable, Sendable {
   /// serves a request or runs
   /// ``ClaudeLanguageModel/authenticateIfNeeded()``.
   case appAttest(clientID: String)
+  /// App Attest through a developer-operated credential broker.
+  ///
+  /// The broker implements Anthropic's App Attest challenge, registration,
+  /// and token endpoints, but generation requests continue to go directly to
+  /// the model's `baseURL`. This supports a keyless Workload Identity
+  /// Federation broker without proxying prompts or responses.
+  ///
+  /// Use this while direct Anthropic app registration is unavailable. Once a
+  /// direct `clientID` is issued, switch to ``appAttest(clientID:)`` and remove
+  /// the broker URL without changing the rest of the session construction.
+  case appAttestBroker(clientID: String, credentialBaseURL: URL)
+}
+
+extension AuthMode {
+  var appAttestConfiguration: (clientID: String, credentialBaseURL: URL?)? {
+    switch self {
+    case .appAttest(let clientID):
+      (clientID, nil)
+    case .appAttestBroker(let clientID, let credentialBaseURL):
+      (clientID, credentialBaseURL)
+    case .apiKey, .proxied:
+      nil
+    }
+  }
 }

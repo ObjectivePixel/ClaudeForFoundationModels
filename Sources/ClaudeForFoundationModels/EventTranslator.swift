@@ -14,6 +14,7 @@ let redactedThinkingMetadataKey = "claude.redactedThinking"
 /// One translation produces at most one response entry and one tool-calls
 /// entry; their IDs are fixed at init so every event for a turn targets the
 /// same entries.
+@available(iOS 27.0, macOS 27.0, visionOS 27.0, watchOS 27.0, *)
 struct EventTranslator: Sendable {
   let responseEntryID: String
   let toolCallsEntryID: String

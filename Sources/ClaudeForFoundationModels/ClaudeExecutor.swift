@@ -10,6 +10,7 @@ import Synchronization
 ///
 /// One executor is created per unique ``Configuration`` and reused. Heavy
 /// resources (the HTTP client) live here, not on ``ClaudeLanguageModel``.
+@available(iOS 27.0, macOS 27.0, visionOS 27.0, watchOS 27.0, *)
 public struct ClaudeExecutor: LanguageModelExecutor {
   public typealias Model = ClaudeLanguageModel
 
@@ -72,7 +73,7 @@ public struct ClaudeExecutor: LanguageModelExecutor {
     switch configuration.authMode {
     case .apiKey(let key) where !key.isEmpty:
       auth = .apiKey(key)
-    case .apiKey, .proxied, .appAttest:
+    case .apiKey, .proxied, .appAttest, .appAttestBroker:
       auth = .none
     }
     self.client = ClaudeClient(
@@ -93,13 +94,15 @@ public struct ClaudeExecutor: LanguageModelExecutor {
     _ configuration: Configuration,
     transport: @autoclosure @escaping () -> any HTTPTransport
   ) throws -> AppAttestSession? {
-    guard case .appAttest(let clientID) = configuration.authMode else { return nil }
+    guard let appAttest = configuration.authMode.appAttestConfiguration else { return nil }
+    let clientID = appAttest.clientID
+    let credentialBaseURL = appAttest.credentialBaseURL ?? configuration.baseURL
     #if canImport(DeviceCheck)
     do {
-      return try AppAttestSession.shared(clientID: clientID, baseURL: configuration.baseURL) {
+      return try AppAttestSession.shared(clientID: clientID, baseURL: credentialBaseURL) {
         AppAttestSession(
           clientID: clientID,
-          baseURL: configuration.baseURL,
+          baseURL: credentialBaseURL,
           attestation: DeviceAttestationService(),
           transport: transport()
         )
@@ -199,7 +202,7 @@ public struct ClaudeExecutor: LanguageModelExecutor {
       return ([:], nil)
     case .proxied(let headers):
       return (headers, nil)
-    case .appAttest:
+    case .appAttest, .appAttestBroker:
       guard let attestSession else { throw AppAttestError.unsupported }
       let token = try await attestSession.currentToken()
       return (["Authorization": "Bearer \(token)"], token)

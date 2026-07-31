@@ -97,6 +97,36 @@ import Testing
     #expect(request.value(forHTTPHeaderField: "x-api-key") == nil)
   }
 
+  @Test func `brokered appAttest keeps generation on the model host`() async throws {
+    let clientID = "example-ios-app"
+    let brokerURL = URL(string: "https://auth.example.com")!
+    let store = InMemoryAppAttestStore()
+    try store.setToken(.init(value: "tok-1", expiresAt: .distantFuture), for: clientID)
+    let transport = MockTransport(body: okStream)
+    let credentialSession = AppAttestSession(
+      clientID: clientID,
+      baseURL: brokerURL,
+      attestation: FakeAttestation(),
+      store: store
+    )
+    let session = LanguageModelSession(
+      model: StubbedClaudeModel(
+        transport: transport,
+        auth: .appAttestBroker(
+          clientID: clientID,
+          credentialBaseURL: brokerURL
+        ),
+        attestSession: credentialSession
+      )
+    )
+
+    _ = try await session.respond(to: "hi")
+
+    let request = try #require(transport.lastRequest)
+    #expect(request.url?.host() == "stub.invalid")
+    #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer tok-1")
+  }
+
   @Test func `appAttest without a credential fails with attestationFailed`() async throws {
     let transport = MockTransport(body: okStream)
     let session = LanguageModelSession(

@@ -13,6 +13,7 @@ import FoundationModels
 /// Pass `--search` to let Claude search the web server-side:
 ///
 ///     ANTHROPIC_API_KEY=<key> swift run ClaudeExample --search "Top spaceflight news this week?"
+@available(iOS 27.0, macOS 27.0, visionOS 27.0, watchOS 27.0, *)
 @main
 struct ClaudeExample {
   static func main() async {
