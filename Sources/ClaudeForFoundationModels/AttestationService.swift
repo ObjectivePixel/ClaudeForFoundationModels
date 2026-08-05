@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import Foundation
+import OSLog
 
 #if canImport(DeviceCheck)
 import DeviceCheck
@@ -26,13 +27,31 @@ protocol AttestationService: Sendable {
 
 #if canImport(DeviceCheck)
 struct DeviceAttestationService: AttestationService {
+  private static let logger = Logger(
+    subsystem: "com.anthropic.ClaudeForFoundationModels",
+    category: "AppAttest"
+  )
+
   init() {}
   var isSupported: Bool { DCAppAttestService.shared.isSupported }
   func generateKey() async throws -> String {
-    try await DCAppAttestService.shared.generateKey()
+    do {
+      return try await DCAppAttestService.shared.generateKey()
+    } catch let error as DCError {
+      Self.log(error, operation: "generateKey")
+      throw error
+    }
   }
   func attestKey(_ keyID: String, clientDataHash: Data) async throws -> Data {
-    try await DCAppAttestService.shared.attestKey(keyID, clientDataHash: clientDataHash)
+    do {
+      return try await DCAppAttestService.shared.attestKey(
+        keyID,
+        clientDataHash: clientDataHash
+      )
+    } catch let error as DCError {
+      Self.log(error, operation: "attestKey")
+      throw error
+    }
   }
   func generateAssertion(_ keyID: String, clientDataHash: Data) async throws -> Data {
     do {
@@ -40,12 +59,66 @@ struct DeviceAttestationService: AttestationService {
         keyID,
         clientDataHash: clientDataHash
       )
-    } catch let error as DCError where error.code == .invalidKey {
-      // The Secure Enclave no longer holds this key. A device erase
-      // followed by a same-device restore brings back the keychain entry
-      // but not the key itself, so a new attestation is required.
-      throw AppAttestError.keyInvalidated
+    } catch let error as DCError {
+      Self.log(error, operation: "generateAssertion")
+      if Self.shouldReplaceKey(
+        after: error.code,
+        keyID: keyID,
+        clientDataHash: clientDataHash
+      ) {
+        // `.invalidKey` directly identifies an unusable key. Some valid,
+        // previously attested keys instead surface `.invalidInput` from
+        // `generateAssertion`. Once the inputs have been validated locally,
+        // both conditions require the same bounded replacement path.
+        throw AppAttestError.keyInvalidated
+      }
+      throw error
     }
+  }
+
+  static func shouldReplaceKey(
+    after code: DCError.Code,
+    keyID: String,
+    clientDataHash: Data
+  ) -> Bool {
+    switch code {
+    case .invalidKey:
+      return true
+    case .invalidInput:
+      return decodeBase64Loose(keyID)?.count == 32 && clientDataHash.count == 32
+    default:
+      return false
+    }
+  }
+
+  static func codeName(_ code: DCError.Code) -> String {
+    switch code {
+    case .unknownSystemFailure: "unknownSystemFailure"
+    case .featureUnsupported: "featureUnsupported"
+    case .invalidInput: "invalidInput"
+    case .invalidKey: "invalidKey"
+    case .serverUnavailable: "serverUnavailable"
+    @unknown default: "unknown"
+    }
+  }
+
+  private static func log(_ error: DCError, operation: String) {
+    let name = codeName(error.code)
+    let message =
+      "App Attest \(operation) failed: "
+      + "DeviceCheck \(name) (code \(error.code.rawValue))"
+    logger.error("\(message, privacy: .public)")
+  }
+
+  private static func decodeBase64Loose(_ string: String) -> Data? {
+    var normalized =
+      string
+      .replacingOccurrences(of: "-", with: "+")
+      .replacingOccurrences(of: "_", with: "/")
+    if normalized.count % 4 != 0 {
+      normalized += String(repeating: "=", count: 4 - normalized.count % 4)
+    }
+    return Data(base64Encoded: normalized)
   }
 }
 #endif
