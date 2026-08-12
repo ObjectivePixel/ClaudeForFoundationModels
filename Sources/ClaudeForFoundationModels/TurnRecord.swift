@@ -140,6 +140,7 @@ extension TurnRecord {
   }
 }
 
+@available(iOS 27.0, macOS 27.0, visionOS 27.0, watchOS 27.0, *)
 extension JSONValue {
   /// The framework value as JSON, structurally; a kind this package doesn't
   /// know reads as `null`.
