@@ -57,8 +57,6 @@ enum ErrorMapper {
     switch error {
     case .unsupported:
       .attestationUnsupported
-    case .operationInProgress:
-      .credentialOperationInProgress
     case .keyInvalidated, .notYetAvailable, .conflictingBaseURL, .requestFailed,
       .malformedResponse:
       .attestationFailed

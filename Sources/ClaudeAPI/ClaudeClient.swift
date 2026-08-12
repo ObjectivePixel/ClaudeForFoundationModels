@@ -46,6 +46,7 @@ package struct ClaudeClient: Sendable {
     headers: [String: String] = [:],
     onEvent: (StreamEvent) async throws -> Void
   ) async throws {
+    let maximumErrorBodyBytes = 64 * 1_024
     var req = request
     req.stream = true
     var response: URLResponse?
@@ -57,7 +58,10 @@ package struct ClaudeClient: Sendable {
       onResponse: { response = $0 },
       onChunk: { chunk in
         if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
-          errorBody.append(chunk)
+          let remaining = maximumErrorBodyBytes - errorBody.count
+          if remaining > 0 {
+            errorBody.append(chunk.prefix(remaining))
+          }
           return
         }
         for event in try parser.consume(chunk) {

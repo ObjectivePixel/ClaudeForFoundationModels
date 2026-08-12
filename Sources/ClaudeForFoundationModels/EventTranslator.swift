@@ -91,6 +91,8 @@ struct EventTranslator: Sendable {
   }
 
   mutating func beginResponse() {
+    assembler = ContentAssembler()
+    currentUsage = TurnUsage()
     targets.removeAll(keepingCapacity: true)
     stopReason = nil
     wroteToChannel = false

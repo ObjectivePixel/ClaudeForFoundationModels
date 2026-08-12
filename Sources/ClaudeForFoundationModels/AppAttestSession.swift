@@ -19,13 +19,14 @@ import Synchronization
 /// 2. Steady state: fetch challenge → sign it → exchange the assertion at
 ///    the token endpoint.
 ///
-/// Credential mutation is serialized explicitly. Overlapping callers receive
-/// a typed error instead of spawning work that outlives either caller.
+/// Credential mutation is serialized explicitly. Overlapping callers wait in
+/// their own task until the active caller finishes, so no credential work can
+/// outlive the request that owns it.
 @available(iOS 27.0, macOS 27.0, visionOS 27.0, watchOS 27.0, *)
 actor AppAttestSession {
   /// One session per client ID, process-wide. A client ID names one Secure
   /// Enclave key, and every assertion for that key must flow through the
-  /// same singleflight; separate sessions would race the server's
+  /// same serialized session; separate sessions would race the server's
   /// `sign_count` check.
   static func shared(
     clientID: String,
@@ -75,19 +76,26 @@ actor AppAttestSession {
   /// otherwise. The first call per install includes Apple's attestation
   /// round-trip, which takes several seconds.
   func attestIfNeeded() async throws {
-    try beginCredentialOperation(.registration)
+    try Task.checkCancellation()
+    if try loadKeyID() != nil { return }
+    try await beginCredentialOperation(.registration)
     defer { endCredentialOperation(.registration) }
+    // A caller that waited for another registration observes its result
+    // before deciding whether another wire operation is necessary.
     _ = try await ensureKeyID()
   }
 
   /// Returns a valid bearer token, refreshing if needed.
   func currentToken() async throws -> String {
+    try Task.checkCancellation()
     if credentials.token == nil, !credentials.storedTokenSuspect {
       credentials.token = try? store.token(for: clientID)
     }
     if let token = validToken() { return token.value }
-    try beginCredentialOperation(.refresh)
+    try await beginCredentialOperation(.refresh)
     defer { endCredentialOperation(.refresh) }
+    // The active owner may have refreshed while this caller was waiting.
+    if let token = validToken() { return token.value }
     return try await refresh()
   }
 
@@ -188,8 +196,11 @@ actor AppAttestSession {
   private var pendingChallenge: (challenge: Challenge, expiresAt: ContinuousClock.Instant)?
   private var credentialOperation: CredentialOperation?
 
-  private func beginCredentialOperation(_ operation: CredentialOperation) throws {
-    guard credentialOperation == nil else { throw AppAttestError.operationInProgress }
+  private func beginCredentialOperation(_ operation: CredentialOperation) async throws {
+    while credentialOperation != nil {
+      try await Task.sleep(for: .milliseconds(50))
+    }
+    try Task.checkCancellation()
     credentialOperation = operation
   }
 
@@ -224,10 +235,13 @@ actor AppAttestSession {
       if let token = validToken(leeway: 0) { return token.value }
       throw error
     }
-    try Task.checkCancellation()
     credentials.token = token
     credentials.storedTokenSuspect = false
     try? store.setToken(token, for: clientID)
+    // A successful server mint is committed locally even when cancellation
+    // arrived during the response. This prevents wasting the credential and
+    // its rate-limited assertion on the next request.
+    try Task.checkCancellation()
     return token.value
   }
 
@@ -256,13 +270,18 @@ actor AppAttestSession {
   /// skips the caches and forces a replacement for a server-rejected key.
   private func ensureKeyID(replacing rejected: String? = nil) async throws -> String {
     if rejected == nil {
-      if let keyID = credentials.keyID { return keyID }
-      if let stored = try store.keyID(for: clientID) {
-        credentials.keyID = stored
-        return stored
-      }
+      if let keyID = try loadKeyID() { return keyID }
     }
     return try await createAndRegisterKey()
+  }
+
+  private func loadKeyID() throws -> String? {
+    if let keyID = credentials.keyID { return keyID }
+    if let stored = try store.keyID(for: clientID) {
+      credentials.keyID = stored
+      return stored
+    }
+    return nil
   }
 
   private func createAndRegisterKey() async throws -> String {
@@ -292,7 +311,6 @@ actor AppAttestSession {
       pacing.noteProvisionFailure(error, backoff: backoff)
       throw error
     }
-    try Task.checkCancellation()
     pacing.clearProvisionFailure()
     // Registration succeeded, so keep the key in memory even if the
     // keychain writes fail. The keychain writes come last because a
@@ -303,6 +321,9 @@ actor AppAttestSession {
     credentials.storedTokenSuspect = false
     try? store.setKeyID(newKeyID, for: clientID)
     try? store.setToken(token, for: clientID)
+    // Registration is irreversible server-side. Persist the accepted key and
+    // token before honoring cancellation so the next request can reuse them.
+    try Task.checkCancellation()
     return newKeyID
   }
 
@@ -327,7 +348,6 @@ actor AppAttestSession {
           "challenge": challenge.wireValue,
         ])
     )
-    try Task.checkCancellation()
     // Rejections are deliberately opaque server-side. The key was freshly
     // generated, so "already registered" can't be the cause and there is
     // nothing to retry.
@@ -369,7 +389,6 @@ actor AppAttestSession {
         .utf8
       )
     )
-    try Task.checkCancellation()
     switch status {
     case 401:
       // Deliberately opaque server-side. Could be an unrecognized or
@@ -623,9 +642,6 @@ enum AppAttestError: LocalizedError, Sendable, Equatable {
   case notYetAvailable
   /// The client ID is already in use against a different base URL.
   case conflictingBaseURL
-  /// Another caller is already registering or refreshing this install's
-  /// credential.
-  case operationInProgress
   /// A wire call failed with a non-recoverable status. `retryAfter` is the
   /// server's `Retry-After` in seconds, when it sent one.
   case requestFailed(endpoint: Endpoint, status: Int, retryAfter: TimeInterval?)
@@ -642,8 +658,6 @@ enum AppAttestError: LocalizedError, Sendable, Equatable {
       "App Attest authentication is not available on this host."
     case .conflictingBaseURL:
       "This client ID is already attesting against a different base URL."
-    case .operationInProgress:
-      "An App Attest credential operation is already in progress."
     case .requestFailed(let endpoint, let status, _):
       "App Attest \(endpoint.rawValue) request failed (HTTP \(status))."
     case .malformedResponse:
