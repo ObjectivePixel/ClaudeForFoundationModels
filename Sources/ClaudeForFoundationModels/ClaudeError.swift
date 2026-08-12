@@ -20,6 +20,9 @@ public enum ClaudeError: LocalizedError, Sendable {
   /// unusable response, an unreachable credential store, and a client ID
   /// already in use against a different base URL.
   case attestationFailed
+  /// Another request is already registering or refreshing this install's
+  /// App Attest credential.
+  case credentialOperationInProgress
 
   public var errorDescription: String? {
     switch self {
@@ -29,6 +32,8 @@ public enum ClaudeError: LocalizedError, Sendable {
       "App Attest is not supported on this device or simulator."
     case .attestationFailed:
       "App attestation failed to produce a credential."
+    case .credentialOperationInProgress:
+      "An App Attest credential operation is already in progress."
     }
   }
 }

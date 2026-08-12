@@ -154,4 +154,12 @@ import Testing
       }
     }
   }
+
+  @Test func `overlapping credential work remains a typed public error`() {
+    guard case ClaudeError.credentialOperationInProgress = ErrorMapper.map(.operationInProgress)
+    else {
+      Issue.record("expected credentialOperationInProgress")
+      return
+    }
+  }
 }

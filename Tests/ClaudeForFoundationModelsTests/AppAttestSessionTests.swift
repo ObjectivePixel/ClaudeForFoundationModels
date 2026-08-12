@@ -494,21 +494,66 @@ import Testing
     }
   }
 
-  @Test func `concurrent attestIfNeeded calls coalesce onto one key generation`() async throws {
+  @Test func `overlapping attestIfNeeded calls reject all but the owner`() async throws {
     let attestation = FakeAttestation()
-    // The singleflight is the subject; each provision that does run fails at
-    // the challenge call.
     let session = makeSession(
       attestation: attestation,
       transport: MockTransport(status: 404, body: Data())
     )
 
-    await withTaskGroup(of: Void.self) { group in
+    let errors = await withTaskGroup(of: AppAttestError?.self, returning: [AppAttestError].self) {
+      group in
       for _ in 0..<8 {
-        group.addTask { try? await session.attestIfNeeded() }
+        group.addTask {
+          do {
+            try await session.attestIfNeeded()
+            return nil
+          } catch let error as AppAttestError {
+            return error
+          } catch {
+            return nil
+          }
+        }
+      }
+      return await group.reduce(into: []) { errors, error in
+        if let error { errors.append(error) }
       }
     }
     #expect(attestation.generateKeyCount == 1)
+    #expect(errors.filter { $0 == .operationInProgress }.count == 7)
+  }
+
+  @Test func `cancelling registration clears ownership and permits retry`() async throws {
+    let store = InMemoryAppAttestStore()
+    let attestation = FakeAttestation()
+    let session = makeSession(
+      store: store,
+      attestation: attestation,
+      transport: MockTransport(status: 404, body: Data())
+    )
+
+    let cancellationObserved = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
+      group.addTask {
+        do {
+          try await session.attestIfNeeded()
+          return false
+        } catch is CancellationError {
+          return true
+        } catch {
+          return false
+        }
+      }
+      try? await Task.sleep(for: .milliseconds(10))
+      group.cancelAll()
+      return await group.reduce(false) { $0 || $1 }
+    }
+
+    #expect(cancellationObserved)
+    #expect(try store.keyID(for: "clid_test") == nil)
+    await #expect(throws: AppAttestError.notYetAvailable) {
+      try await session.attestIfNeeded()
+    }
+    #expect(attestation.generateKeyCount == 2)
   }
 
   @Test func `form encoding percent-encodes reserved characters`() {
@@ -624,7 +669,7 @@ final class FakeAttestation: AttestationService {
   func generateKey() async throws -> String {
     state.withLock { $0.keys += 1 }
     // Suspends before returning, like the real seconds-long call.
-    try? await Task.sleep(for: .milliseconds(50))
+    try await Task.sleep(for: .milliseconds(50))
     return Self.keyID
   }
   func attestKey(_ keyID: String, clientDataHash: Data) async throws -> Data {

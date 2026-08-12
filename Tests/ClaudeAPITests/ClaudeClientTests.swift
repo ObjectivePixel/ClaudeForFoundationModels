@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import Foundation
-import Synchronization
 import Testing
 
 @testable import ClaudeAPI
@@ -33,7 +32,7 @@ import Testing
     #expect(response.content == [.text("Hi")])
     #expect(response.stopReason == .endTurn)
 
-    let request = try #require(transport.lastRequest)
+    let request = try #require(await transport.lastRequest())
     #expect(request.httpMethod == "POST")
     #expect(request.url?.path() == "/v1/messages")
     #expect(request.value(forHTTPHeaderField: "x-api-key") == "sk-test")
@@ -71,7 +70,7 @@ import Testing
         headers: ["X-App-Token": "abc", "anthropic-beta": "feature-1"]
       )
 
-    let request = try #require(transport.lastRequest)
+    let request = try #require(await transport.lastRequest())
     #expect(request.value(forHTTPHeaderField: "X-App-Token") == "abc")
     #expect(request.value(forHTTPHeaderField: "anthropic-beta") == "feature-1")
     #expect(request.value(forHTTPHeaderField: "x-api-key") == "sk-test")
@@ -129,11 +128,9 @@ import Testing
     )
 
     var events: [StreamEvent] = []
-    for try await event in client(transport)
-      .stream(
-        MessagesRequest(model: "m", messages: [.user("hi")])
-      )
-    {
+    try await client(transport).stream(
+      MessagesRequest(model: "m", messages: [.user("hi")])
+    ) { event in
       events.append(event)
     }
 
@@ -157,11 +154,9 @@ import Testing
     )
 
     var texts: [String] = []
-    for try await event in client(transport)
-      .stream(
-        MessagesRequest(model: "m", messages: [.user("hi")])
-      )
-    {
+    try await client(transport).stream(
+      MessagesRequest(model: "m", messages: [.user("hi")])
+    ) { event in
       if case .contentBlockDelta(_, .text(let t)) = event { texts.append(t) }
     }
     #expect(texts == ["multi"])
@@ -178,11 +173,9 @@ import Testing
     )
 
     let error = try await #require(throws: APIError.self) {
-      for try await _ in client(transport)
-        .stream(
-          MessagesRequest(model: "m", messages: [.user("hi")])
-        )
-      {}
+      try await client(transport).stream(
+        MessagesRequest(model: "m", messages: [.user("hi")])
+      ) { _ in }
     }
     #expect(error.kind == .overloaded)
   }
@@ -191,11 +184,9 @@ import Testing
     let transport = MockTransport(status: 401, body: Data("<html>denied</html>".utf8))
 
     let error = try await #require(throws: APIError.self) {
-      for try await _ in client(transport)
-        .stream(
-          MessagesRequest(model: "m", messages: [.user("hi")])
-        )
-      {}
+      try await client(transport).stream(
+        MessagesRequest(model: "m", messages: [.user("hi")])
+      ) { _ in }
     }
     #expect(error.kind == .authentication)
   }
@@ -209,16 +200,14 @@ import Testing
     )
 
     let error = try await #require(throws: APIError.self) {
-      for try await _ in client(transport)
-        .stream(
-          MessagesRequest(model: "m", messages: [.user("hi")])
-        )
-      {}
+      try await client(transport).stream(
+        MessagesRequest(model: "m", messages: [.user("hi")])
+      ) { _ in }
     }
     #expect(error.kind == .invalidRequest)
   }
 
-  @Test func `streamText yields cumulative snapshots`() async throws {
+  @Test func `stream consumer can accumulate text snapshots`() async throws {
     let transport = MockTransport(
       body: sse([
         [
@@ -234,14 +223,79 @@ import Testing
     )
 
     var snapshots: [String] = []
-    for try await snapshot in client(transport)
-      .streamText(
-        MessagesRequest(model: "m", messages: [.user("hi")])
-      )
-    {
-      snapshots.append(snapshot)
+    var accumulated = ""
+    try await client(transport).stream(
+      MessagesRequest(model: "m", messages: [.user("hi")])
+    ) { event in
+      if case .contentBlockDelta(_, .text(let text)) = event {
+        accumulated += text
+        snapshots.append(accumulated)
+      }
     }
     #expect(snapshots == ["Hel", "Hello"])
+  }
+
+  @Test func `streaming waits for the event consumer before reading the next chunk`() async throws {
+    let first = sse([["data: {\"type\":\"ping\"}"]])
+    let second = sse([["data: {\"type\":\"message_stop\"}"]])
+    let flow = StreamFlowRecorder()
+    let transport = ChunkedTransport(chunks: [first, second], flow: flow)
+
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      group.addTask {
+        try await self.client(transport).stream(
+          MessagesRequest(model: "m", messages: [.user("hi")])
+        ) { _ in
+          let isFirst = await flow.consumerBegan()
+          if isFirst { try await Task.sleep(for: .milliseconds(100)) }
+        }
+      }
+
+      while await flow.consumerCount == 0 {
+        try await Task.sleep(for: .milliseconds(1))
+      }
+      try await Task.sleep(for: .milliseconds(20))
+      let chunksStartedWhileConsumerWasSuspended = await flow.chunkCount
+      #expect(chunksStartedWhileConsumerWasSuspended == 1)
+      try await group.waitForAll()
+    }
+
+    let finalChunkCount = await flow.chunkCount
+    #expect(finalChunkCount == 2)
+  }
+
+  @Test func `cancelling the caller cancels streaming in the same task tree`() async throws {
+    let flow = StreamFlowRecorder()
+    let transport = ChunkedTransport(
+      chunks: [sse([["data: {\"type\":\"ping\"}"]])],
+      flow: flow
+    )
+
+    let cancellationObserved = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
+      group.addTask {
+        do {
+          try await self.client(transport).stream(
+            MessagesRequest(model: "m", messages: [.user("hi")])
+          ) { _ in
+            _ = await flow.consumerBegan()
+            try await Task.sleep(for: .seconds(10))
+          }
+          return false
+        } catch is CancellationError {
+          return true
+        } catch {
+          return false
+        }
+      }
+
+      while await flow.consumerCount == 0 {
+        try? await Task.sleep(for: .milliseconds(1))
+      }
+      group.cancelAll()
+      return await group.reduce(false) { $0 || $1 }
+    }
+
+    #expect(cancellationObserved)
   }
 
   // MARK: - Helpers
@@ -269,7 +323,7 @@ private final class MockTransport: HTTPTransport {
   let headers: [String: String]
   let body: Data
 
-  private let captured = Mutex<URLRequest?>(nil)
+  private let captured = RequestCapture()
 
   init(status: Int = 200, headers: [String: String] = [:], body: Data) {
     self.status = status
@@ -277,27 +331,21 @@ private final class MockTransport: HTTPTransport {
     self.body = body
   }
 
-  var lastRequest: URLRequest? { captured.withLock { $0 } }
+  func lastRequest() async -> URLRequest? { await captured.lastRequest }
 
   func data(for request: URLRequest) async throws -> (Data, URLResponse) {
-    record(request)
+    await captured.record(request)
     return (body, response(for: request))
   }
 
-  func bytes(
-    for request: URLRequest
-  ) async throws -> (AsyncThrowingStream<UInt8, Error>, URLResponse) {
-    record(request)
-    let body = self.body
-    let stream = AsyncThrowingStream<UInt8, Error> { continuation in
-      for byte in body { continuation.yield(byte) }
-      continuation.finish()
-    }
-    return (stream, response(for: request))
-  }
-
-  private func record(_ request: URLRequest) {
-    captured.withLock { $0 = request }
+  func stream(
+    for request: URLRequest,
+    onResponse: (URLResponse) throws -> Void,
+    onChunk: (Data) async throws -> Void
+  ) async throws {
+    await captured.record(request)
+    try onResponse(response(for: request))
+    try await onChunk(body)
   }
 
   private func response(for request: URLRequest) -> URLResponse {
@@ -306,6 +354,64 @@ private final class MockTransport: HTTPTransport {
       statusCode: status,
       httpVersion: "HTTP/1.1",
       headerFields: headers
+    )!
+  }
+}
+
+private actor RequestCapture {
+  private(set) var lastRequest: URLRequest?
+
+  func record(_ request: URLRequest) {
+    lastRequest = request
+  }
+}
+
+private actor StreamFlowRecorder {
+  private(set) var chunkCount = 0
+  private(set) var consumerCount = 0
+
+  func chunkBegan() {
+    chunkCount += 1
+  }
+
+  func consumerBegan() -> Bool {
+    consumerCount += 1
+    return consumerCount == 1
+  }
+}
+
+private final class ChunkedTransport: HTTPTransport {
+  private let chunks: [Data]
+  private let flow: StreamFlowRecorder
+
+  init(chunks: [Data], flow: StreamFlowRecorder) {
+    self.chunks = chunks
+    self.flow = flow
+  }
+
+  func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+    (chunks.reduce(into: Data()) { $0.append($1) }, response(for: request))
+  }
+
+  func stream(
+    for request: URLRequest,
+    onResponse: (URLResponse) throws -> Void,
+    onChunk: (Data) async throws -> Void
+  ) async throws {
+    try onResponse(response(for: request))
+    for chunk in chunks {
+      try Task.checkCancellation()
+      await flow.chunkBegan()
+      try await onChunk(chunk)
+    }
+  }
+
+  private func response(for request: URLRequest) -> URLResponse {
+    HTTPURLResponse(
+      url: request.url!,
+      statusCode: 200,
+      httpVersion: "HTTP/1.1",
+      headerFields: [:]
     )!
   }
 }

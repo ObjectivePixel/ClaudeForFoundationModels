@@ -32,6 +32,9 @@ struct EventTranslator: Sendable {
   /// continued turn reports the whole turn's usage.
   private var settledUsage = TurnUsage()
   private var currentUsage = TurnUsage()
+  private var targets: [Int: Target] = [:]
+  private var stopReason: StopReason?
+  private(set) var wroteToChannel = false
 
   fileprivate struct TurnUsage {
     var prompt = 0
@@ -87,102 +90,78 @@ struct EventTranslator: Sendable {
     case responseRecordOnly
   }
 
-  /// Relays all channel writes so the first-write callback is handled in
-  /// one place instead of at every send site.
-  private final class ChannelSink {
-    private let channel: LanguageModelExecutorGenerationChannel
-    private var pendingFirstWrite: (@Sendable () -> Void)?
+  mutating func beginResponse() {
+    targets.removeAll(keepingCapacity: true)
+    stopReason = nil
+    wroteToChannel = false
+  }
 
-    init(
-      _ channel: LanguageModelExecutorGenerationChannel,
-      onFirstWrite: (@Sendable () -> Void)?
-    ) {
-      self.channel = channel
-      self.pendingFirstWrite = onFirstWrite
-    }
+  /// Translates one response event in the caller's task. Awaiting every
+  /// channel write keeps transport reads naturally backpressured.
+  mutating func consume(
+    _ event: StreamEvent,
+    into channel: LanguageModelExecutorGenerationChannel
+  ) async throws {
+    try Task.checkCancellation()
+    let completedBlock = assembler.consume(event)
 
-    func send(_ event: LanguageModelExecutorGenerationChannel.Event) async {
-      pendingFirstWrite?()
-      pendingFirstWrite = nil
-      await channel.send(event)
+    switch event {
+    case .messageStart(let response):
+      currentUsage = TurnUsage(usage: response.usage)
+
+    case .contentBlockStart(let index, let block):
+      let target = Self.target(for: block)
+      targets[index] = target
+      if case .toolUse(let id, let name) = target {
+        await write(
+          .toolCalls(
+            entryID: toolCallsEntryID,
+            action: .toolCall(id: id, name: name, action: .appendArguments("", tokenCount: 0))
+          ),
+          into: channel
+        )
+      }
+
+    case .contentBlockDelta(let index, let delta):
+      await send(delta, to: targets[index], into: channel)
+
+    case .contentBlockStop(let index):
+      let target = targets.removeValue(forKey: index)
+      if let completedBlock { await record(completedBlock, for: target, into: channel) }
+
+    case .messageDelta(let reason, let usage):
+      stopReason = reason ?? stopReason
+      if usage.inputTokens != nil || usage.cacheReadInputTokens != nil {
+        let updated = TurnUsage(usage: usage)
+        currentUsage.prompt = updated.prompt
+        currentUsage.cached = updated.cached
+      }
+      currentUsage.output = usage.outputTokens
+      let total = settledUsage + currentUsage
+      await write(
+        .response(
+          entryID: responseEntryID,
+          action: .updateUsage(
+            input: .init(totalTokenCount: total.prompt, cachedTokenCount: total.cached),
+            output: .init(totalTokenCount: total.output, reasoningTokenCount: 0)
+          )
+        ),
+        into: channel
+      )
+
+    case .messageStop, .ping, .unknown:
+      break
+
+    case .error(let apiError):
+      throw apiError
     }
   }
 
-  /// Translates one response's stream. Returns the response's stop reason;
-  /// `.pauseTurn` means the turn should be continued with another response.
-  ///
-  /// - Parameter onFirstChannelWrite: Invoked once, immediately before the
-  ///   first write to the channel. Events that write nothing (`ping`,
-  ///   `message_start`) don't trigger it.
-  mutating func translate(
-    _ events: AsyncThrowingStream<StreamEvent, Error>,
-    into channel: LanguageModelExecutorGenerationChannel,
-    onFirstChannelWrite: (@Sendable () -> Void)? = nil
-  ) async throws -> StopReason? {
-    let channel = ChannelSink(channel, onFirstWrite: onFirstChannelWrite)
-    var targets: [Int: Target] = [:]
-    var stopReason: StopReason?
-
-    for try await event in events {
-      try Task.checkCancellation()
-      let completedBlock = assembler.consume(event)
-
-      switch event {
-      case .messageStart(let response):
-        currentUsage = TurnUsage(usage: response.usage)
-
-      case .contentBlockStart(let index, let block):
-        let target = Self.target(for: block)
-        targets[index] = target
-        if case .toolUse(let id, let name) = target {
-          // Opens the call even if no argument deltas follow.
-          await channel.send(
-            .toolCalls(
-              entryID: toolCallsEntryID,
-              action: .toolCall(id: id, name: name, action: .appendArguments("", tokenCount: 0))
-            )
-          )
-        }
-
-      case .contentBlockDelta(let index, let delta):
-        await send(delta, to: targets[index], via: channel)
-
-      case .contentBlockStop(let index):
-        let target = targets.removeValue(forKey: index)
-        if let completedBlock { await record(completedBlock, for: target, via: channel) }
-
-      case .messageDelta(let reason, let usage):
-        stopReason = reason ?? stopReason
-        // Server-tool turns grow the prompt mid-response; message_delta
-        // carries updated input-side totals when that happens.
-        if usage.inputTokens != nil || usage.cacheReadInputTokens != nil {
-          let updated = TurnUsage(usage: usage)
-          currentUsage.prompt = updated.prompt
-          currentUsage.cached = updated.cached
-        }
-        currentUsage.output = usage.outputTokens
-        let total = settledUsage + currentUsage
-        await channel.send(
-          .response(
-            entryID: responseEntryID,
-            action: .updateUsage(
-              input: .init(totalTokenCount: total.prompt, cachedTokenCount: total.cached),
-              output: .init(totalTokenCount: total.output, reasoningTokenCount: 0)
-            )
-          )
-        )
-
-      case .messageStop, .ping, .unknown:
-        break
-
-      case .error(let apiError):
-        throw apiError
-      }
-    }
-    // Settled only once the response has been read to the end: a response
-    // abandoned partway (and retried) must not count toward the turn.
+  /// Settles usage only after the complete response has been consumed.
+  mutating func finishResponse() -> StopReason? {
     settledUsage = settledUsage + currentUsage
     currentUsage = TurnUsage()
+    targets.removeAll(keepingCapacity: true)
     return stopReason
   }
 
@@ -204,27 +183,29 @@ struct EventTranslator: Sendable {
   /// still arrive via `updateUsage` at `message_delta`.
   static let deltaTokenCount = 1
 
-  private func send(
+  private mutating func send(
     _ delta: StreamEvent.Delta,
     to target: Target?,
-    via channel: ChannelSink
+    into channel: LanguageModelExecutorGenerationChannel
   ) async {
     switch (delta, target) {
     case (.text(let text), .text(let segmentID)) where !text.isEmpty:
-      await channel.send(
+      await write(
         .response(
           entryID: responseEntryID,
           action: .appendText(text, segmentID: segmentID, tokenCount: Self.deltaTokenCount)
-        )
+        ),
+        into: channel
       )
 
     case (.thinking(let text), .thinking(let entryID)):
-      await channel.send(
-        .reasoning(entryID: entryID, action: .appendText(text, tokenCount: Self.deltaTokenCount))
+      await write(
+        .reasoning(entryID: entryID, action: .appendText(text, tokenCount: Self.deltaTokenCount)),
+        into: channel
       )
 
     case (.inputJSON(let chunk), .toolUse(let id, let name)):
-      await channel.send(
+      await write(
         .toolCalls(
           entryID: toolCallsEntryID,
           action: .toolCall(
@@ -232,7 +213,8 @@ struct EventTranslator: Sendable {
             name: name,
             action: .appendArguments(chunk, tokenCount: Self.deltaTokenCount)
           )
-        )
+        ),
+        into: channel
       )
 
     // Everything else — signatures, citations, server-tool input — reaches
@@ -247,7 +229,7 @@ struct EventTranslator: Sendable {
   private mutating func record(
     _ json: JSONValue,
     for target: Target?,
-    via channel: ChannelSink
+    into channel: LanguageModelExecutorGenerationChannel
   ) async {
     let block = TurnRecord.Block(position: content.count, json: json)
     content.append(json)
@@ -260,19 +242,21 @@ struct EventTranslator: Sendable {
       if case .string(let encoded)? = json[signatureField],
         let signature = Data(base64Encoded: encoded)
       {
-        await channel.send(
-          .reasoning(entryID: entryID, action: .updateSignature(signature, tokenCount: 0))
+        await write(
+          .reasoning(entryID: entryID, action: .updateSignature(signature, tokenCount: 0)),
+          into: channel
         )
       }
-      await channel.send(
+      await write(
         .reasoning(
           entryID: entryID,
           action: .updateMetadata(TurnRecord.metadata(turn: turn, stored: [block.stored]))
-        )
+        ),
+        into: channel
       )
 
     case .toolUse(let id, let name):
-      await channel.send(
+      await write(
         .toolCalls(
           entryID: toolCallsEntryID,
           action: .toolCall(
@@ -280,28 +264,39 @@ struct EventTranslator: Sendable {
             name: name,
             action: .updateMetadata(TurnRecord.metadata(turn: turn, stored: [block.stored]))
           )
-        )
+        ),
+        into: channel
       )
 
     case .text, .serverToolUse, .responseRecordOnly, nil:
       responseStored.append(block.stored)
-      await channel.send(
+      await write(
         .response(
           entryID: responseEntryID,
           action: .updateMetadata(TurnRecord.metadata(turn: turn, stored: responseStored))
-        )
+        ),
+        into: channel
       )
       // The placeholder goes in once its call is on the record, so the
       // snapshot it triggers can already resolve it.
       if case .serverToolUse(let id) = target {
-        await channel.send(
+        await write(
           .response(
             entryID: responseEntryID,
             action: .appendText("", segmentID: id, tokenCount: Self.deltaTokenCount)
-          )
+          ),
+          into: channel
         )
       }
     }
+  }
+
+  private mutating func write(
+    _ event: LanguageModelExecutorGenerationChannel.Event,
+    into channel: LanguageModelExecutorGenerationChannel
+  ) async {
+    wroteToChannel = true
+    await channel.send(event)
   }
 }
 

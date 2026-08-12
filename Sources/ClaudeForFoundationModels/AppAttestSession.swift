@@ -19,10 +19,8 @@ import Synchronization
 /// 2. Steady state: fetch challenge → sign it → exchange the assertion at
 ///    the token endpoint.
 ///
-/// Refresh and registration are each singleflighted: the server's
-/// `sign_count` check is strictly increasing, so parallel assertions from
-/// one key reject, and parallel registrations waste rate-limited Apple
-/// attestations.
+/// Credential mutation is serialized explicitly. Overlapping callers receive
+/// a typed error instead of spawning work that outlives either caller.
 @available(iOS 27.0, macOS 27.0, visionOS 27.0, watchOS 27.0, *)
 actor AppAttestSession {
   /// One session per client ID, process-wide. A client ID names one Secure
@@ -77,22 +75,20 @@ actor AppAttestSession {
   /// otherwise. The first call per install includes Apple's attestation
   /// round-trip, which takes several seconds.
   func attestIfNeeded() async throws {
+    try beginCredentialOperation(.registration)
+    defer { endCredentialOperation(.registration) }
     _ = try await ensureKeyID()
   }
 
-  /// Returns a valid bearer token, refreshing if needed. Concurrent callers
-  /// coalesce onto a single in-flight refresh; the shared refresh is not
-  /// cancelled when one waiter is.
+  /// Returns a valid bearer token, refreshing if needed.
   func currentToken() async throws -> String {
     if credentials.token == nil, !credentials.storedTokenSuspect {
       credentials.token = try? store.token(for: clientID)
     }
     if let token = validToken() { return token.value }
-    if let refreshInFlight { return try await refreshInFlight.value }
-    let task = Task { try await refresh() }
-    refreshInFlight = task
-    defer { if refreshInFlight == task { refreshInFlight = nil } }
-    return try await task.value
+    try beginCredentialOperation(.refresh)
+    defer { endCredentialOperation(.refresh) }
+    return try await refresh()
   }
 
   /// Call when a request 401s. `usedToken` is the bearer the failed request
@@ -118,6 +114,11 @@ actor AppAttestSession {
     /// Blocks reloading the stored token after an invalidation whose
     /// keychain delete may have failed.
     var storedTokenSuspect = false
+  }
+
+  private enum CredentialOperation: Equatable {
+    case registration
+    case refresh
   }
 
   /// A time window on a monotonic clock, so wall-clock corrections don't
@@ -185,8 +186,17 @@ actor AppAttestSession {
   /// is stateless server-side; App Attest's key uniqueness and assertion
   /// counter provide replay protection when it is consumed.
   private var pendingChallenge: (challenge: Challenge, expiresAt: ContinuousClock.Instant)?
-  private var refreshInFlight: Task<String, Error>?
-  private var registrationInFlight: Task<String, Error>?
+  private var credentialOperation: CredentialOperation?
+
+  private func beginCredentialOperation(_ operation: CredentialOperation) throws {
+    guard credentialOperation == nil else { throw AppAttestError.operationInProgress }
+    credentialOperation = operation
+  }
+
+  private func endCredentialOperation(_ operation: CredentialOperation) {
+    precondition(credentialOperation == operation)
+    credentialOperation = nil
+  }
 
   private func validToken(leeway: TimeInterval? = nil) -> StoredToken? {
     guard let token = credentials.token,
@@ -214,6 +224,7 @@ actor AppAttestSession {
       if let token = validToken(leeway: 0) { return token.value }
       throw error
     }
+    try Task.checkCancellation()
     credentials.token = token
     credentials.storedTokenSuspect = false
     try? store.setToken(token, for: clientID)
@@ -243,7 +254,6 @@ actor AppAttestSession {
 
   /// Returns the loaded key, or registers a fresh one. Passing `replacing`
   /// skips the caches and forces a replacement for a server-rejected key.
-  /// Concurrent registrations coalesce onto one attempt.
   private func ensureKeyID(replacing rejected: String? = nil) async throws -> String {
     if rejected == nil {
       if let keyID = credentials.keyID { return keyID }
@@ -252,11 +262,7 @@ actor AppAttestSession {
         return stored
       }
     }
-    if let registrationInFlight { return try await registrationInFlight.value }
-    let task = Task { try await createAndRegisterKey() }
-    registrationInFlight = task
-    defer { if registrationInFlight == task { registrationInFlight = nil } }
-    return try await task.value
+    return try await createAndRegisterKey()
   }
 
   private func createAndRegisterKey() async throws -> String {
@@ -266,7 +272,9 @@ actor AppAttestSession {
     // retry freely; only the attestation and registration steps below
     // record a backoff.
     let newKeyID = try await attestation.generateKey()
+    try Task.checkCancellation()
     let challenge = try await fetchChallenge(keyID: newKeyID)
+    try Task.checkCancellation()
     let token: StoredToken
     do {
       token = try await attestAndRegister(keyID: newKeyID, challenge: challenge)
@@ -284,6 +292,7 @@ actor AppAttestSession {
       pacing.noteProvisionFailure(error, backoff: backoff)
       throw error
     }
+    try Task.checkCancellation()
     pacing.clearProvisionFailure()
     // Registration succeeded, so keep the key in memory even if the
     // keychain writes fail. The keychain writes come last because a
@@ -306,6 +315,7 @@ actor AppAttestSession {
       keyID,
       clientDataHash: Self.registrationClientDataHash(challenge: challenge.data)
     )
+    try Task.checkCancellation()
     let (data, status, retryAfter) = try await post(
       path: "v1/oauth/app-attest/register",
       contentType: "application/json",
@@ -317,6 +327,7 @@ actor AppAttestSession {
           "challenge": challenge.wireValue,
         ])
     )
+    try Task.checkCancellation()
     // Rejections are deliberately opaque server-side. The key was freshly
     // generated, so "already registered" can't be the cause and there is
     // nothing to retry.
@@ -334,6 +345,7 @@ actor AppAttestSession {
       throw AppAttestError.requestFailed(endpoint: .token, status: 429, retryAfter: nil)
     }
     let challenge = try await fetchChallenge(keyID: keyID)
+    try Task.checkCancellation()
     let assertion = try await attestation.generateAssertion(
       keyID,
       clientDataHash: Self.assertionClientDataHash(
@@ -342,6 +354,7 @@ actor AppAttestSession {
         keyID: keyIDBytes
       )
     )
+    try Task.checkCancellation()
     let (data, status, retryAfter) = try await post(
       path: "v1/oauth/token",
       contentType: "application/x-www-form-urlencoded",
@@ -356,6 +369,7 @@ actor AppAttestSession {
         .utf8
       )
     )
+    try Task.checkCancellation()
     switch status {
     case 401:
       // Deliberately opaque server-side. Could be an unrecognized or
@@ -609,6 +623,9 @@ enum AppAttestError: LocalizedError, Sendable, Equatable {
   case notYetAvailable
   /// The client ID is already in use against a different base URL.
   case conflictingBaseURL
+  /// Another caller is already registering or refreshing this install's
+  /// credential.
+  case operationInProgress
   /// A wire call failed with a non-recoverable status. `retryAfter` is the
   /// server's `Retry-After` in seconds, when it sent one.
   case requestFailed(endpoint: Endpoint, status: Int, retryAfter: TimeInterval?)
@@ -625,6 +642,8 @@ enum AppAttestError: LocalizedError, Sendable, Equatable {
       "App Attest authentication is not available on this host."
     case .conflictingBaseURL:
       "This client ID is already attesting against a different base URL."
+    case .operationInProgress:
+      "An App Attest credential operation is already in progress."
     case .requestFailed(let endpoint, let status, _):
       "App Attest \(endpoint.rawValue) request failed (HTTP \(status))."
     case .malformedResponse:

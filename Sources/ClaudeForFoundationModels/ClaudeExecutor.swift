@@ -4,7 +4,6 @@
 import ClaudeAPI
 import Foundation
 import FoundationModels
-import Synchronization
 
 /// Executes generation requests against the Messages API.
 ///
@@ -149,12 +148,8 @@ public struct ClaudeExecutor: LanguageModelExecutor {
   }
 
   public func prewarm(model: ClaudeLanguageModel, transcript: Transcript) {
-    // Attesting at launch keeps the multi-second first-run Apple
-    // round-trip off the user's first prompt. Errors are dropped because
-    // the prewarm contract has no way to report them.
-    if let attestSession {
-      Task { try? await attestSession.attestIfNeeded() }
-    }
+    // App Attest is prepared explicitly by `authenticateIfNeeded()` so the
+    // operation remains owned by its caller and failures are observable.
   }
 
   /// Sends one request of a turn and translates its response into the
@@ -164,14 +159,13 @@ public struct ClaudeExecutor: LanguageModelExecutor {
     translating translator: inout EventTranslator,
     into channel: LanguageModelExecutorGenerationChannel
   ) async throws -> StopReason? {
-    let channelWritten = Mutex(false)
     let (headers, bearer) = try await authContext()
     do {
-      return try await translator.translate(
-        client.stream(request, headers: headers),
-        into: channel,
-        onFirstChannelWrite: { @Sendable in channelWritten.withLock { $0 = true } }
-      )
+      translator.beginResponse()
+      try await client.stream(request, headers: headers) { event in
+        try await translator.consume(event, into: channel)
+      }
+      return translator.finishResponse()
     } catch let error as APIError where error.kind == .authentication && attestSession != nil {
       // The token raced expiration or was revoked between fetch and
       // validation. Invalidate it either way, so the next request doesn't
@@ -180,13 +174,14 @@ public struct ClaudeExecutor: LanguageModelExecutor {
       // only once: a second rejection means the key or registration is
       // actually bad.
       await attestSession?.invalidateToken(usedToken: bearer)
-      guard !channelWritten.withLock({ $0 }) else { throw error }
+      guard !translator.wroteToChannel else { throw error }
       let (retryHeaders, retryBearer) = try await authContext()
       do {
-        return try await translator.translate(
-          client.stream(request, headers: retryHeaders),
-          into: channel
-        )
+        translator.beginResponse()
+        try await client.stream(request, headers: retryHeaders) { event in
+          try await translator.consume(event, into: channel)
+        }
+        return translator.finishResponse()
       } catch let error as APIError where error.kind == .authentication {
         await attestSession?.invalidateToken(usedToken: retryBearer)
         throw error
