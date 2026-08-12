@@ -43,56 +43,40 @@ package struct ClaudeClient: Sendable {
   /// `headers` behaves as in ``send(_:headers:)``.
   package func stream(
     _ request: MessagesRequest,
-    headers: [String: String] = [:]
-  ) -> AsyncThrowingStream<StreamEvent, Error> {
-    AsyncThrowingStream { continuation in
-      let task = Task {
-        do {
-          var req = request
-          req.stream = true
-          let (bytes, response) = try await transport.bytes(
-            for: urlRequest(for: req, headers: headers)
-          )
-          if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
-            // Error responses arrive as a JSON body, not SSE.
-            var body = Data()
-            for try await byte in bytes { body.append(byte) }
-            try Self.check(response, body: body)
-          }
-          for try await event in SSEParser.events(from: bytes) {
-            continuation.yield(event)
-          }
-          continuation.finish()
-        } catch {
-          continuation.finish(throwing: error)
-        }
-      }
-      continuation.onTermination = { _ in task.cancel() }
-    }
-  }
+    headers: [String: String] = [:],
+    onEvent: (StreamEvent) async throws -> Void
+  ) async throws {
+    let maximumErrorBodyBytes = 64 * 1_024
+    var req = request
+    req.stream = true
+    var response: URLResponse?
+    var errorBody = Data()
+    var parser = SSEParser()
 
-  /// Convenience over ``stream(_:headers:)``: yields the accumulated text
-  /// after each delta — snapshots of the full text so far, not increments.
-  package func streamText(
-    _ request: MessagesRequest,
-    headers: [String: String] = [:]
-  ) -> AsyncThrowingStream<String, Error> {
-    AsyncThrowingStream { continuation in
-      let task = Task {
-        do {
-          var acc = ""
-          for try await event in stream(request, headers: headers) {
-            if case .contentBlockDelta(_, .text(let t)) = event {
-              acc += t
-              continuation.yield(acc)
-            }
+    try await transport.stream(
+      for: urlRequest(for: req, headers: headers),
+      onResponse: { response = $0 },
+      onChunk: { chunk in
+        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+          let remaining = maximumErrorBodyBytes - errorBody.count
+          if remaining > 0 {
+            errorBody.append(chunk.prefix(remaining))
           }
-          continuation.finish()
-        } catch {
-          continuation.finish(throwing: error)
+          return
+        }
+        for event in try parser.consume(chunk) {
+          try await onEvent(event)
         }
       }
-      continuation.onTermination = { _ in task.cancel() }
+    )
+
+    guard let response else { throw URLError(.badServerResponse) }
+    if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+      try Self.check(response, body: errorBody)
+      return
+    }
+    for event in try parser.finish() {
+      try await onEvent(event)
     }
   }
 

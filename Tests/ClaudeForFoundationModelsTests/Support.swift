@@ -199,15 +199,14 @@ final class MockTransport: HTTPTransport {
     return (canned.body, response(request, canned))
   }
 
-  func bytes(
-    for request: URLRequest
-  ) async throws -> (AsyncThrowingStream<UInt8, Error>, URLResponse) {
+  func stream(
+    for request: URLRequest,
+    onResponse: (URLResponse) throws -> Void,
+    onChunk: (Data) async throws -> Void
+  ) async throws {
     let canned = next(recording: request)
-    let stream = AsyncThrowingStream<UInt8, Error> { continuation in
-      for byte in canned.body { continuation.yield(byte) }
-      continuation.finish()
-    }
-    return (stream, response(request, canned))
+    try onResponse(response(request, canned))
+    try await onChunk(canned.body)
   }
 
   private func next(recording request: URLRequest) -> CannedResponse {

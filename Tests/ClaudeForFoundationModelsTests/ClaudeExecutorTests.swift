@@ -178,9 +178,9 @@ import Testing
     let store = InMemoryAppAttestStore()
     try store.setKeyID(FakeAttestation.keyID, for: "clid_test")
     try store.setToken(.init(value: "tok-1", expiresAt: .distantFuture), for: "clid_test")
-    // A ping and a message_start (reporting 100 prompt tokens) arrive before
-    // the auth error. Neither writes to the channel, so the retry still
-    // fires, and the abandoned attempt's usage must not be counted.
+    // A ping, message_start, and an empty block start arrive before the auth
+    // error. None writes to the channel, so the retry still fires. Partial
+    // assembler state and usage from the abandoned response must be reset.
     let transport = MockTransport(responses: [
       (200, preludeThenAuthErrorBody),
       (200, WireFixtures.challengeBody),
@@ -322,6 +322,10 @@ import Testing
     [
       "event: message_start",
       #"data: {"type":"message_start","message":{"id":"msg_0","type":"message","role":"assistant","content":[],"model":"claude-sonnet-5","usage":{"input_tokens":100,"output_tokens":1}}}"#,
+    ],
+    [
+      "event: content_block_start",
+      #"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
     ],
     [
       "event: error",

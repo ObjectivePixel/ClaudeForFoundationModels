@@ -494,21 +494,151 @@ import Testing
     }
   }
 
-  @Test func `concurrent attestIfNeeded calls coalesce onto one key generation`() async throws {
+  @Test func `overlapping attestIfNeeded calls share one registered key`() async throws {
     let attestation = FakeAttestation()
-    // The singleflight is the subject; each provision that does run fails at
-    // the challenge call.
+    let store = InMemoryAppAttestStore()
     let session = makeSession(
+      store: store,
+      attestation: attestation,
+      transport: MockTransport(responses: [
+        (200, WireFixtures.challengeBody),
+        (200, WireFixtures.oauthBody(token: "registered-token")),
+      ])
+    )
+
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      for _ in 0..<8 {
+        group.addTask {
+          try await session.attestIfNeeded()
+        }
+      }
+      try await group.waitForAll()
+    }
+
+    #expect(attestation.generateKeyCount == 1)
+    #expect(try store.keyID(for: "clid_test") == FakeAttestation.keyID)
+  }
+
+  @Test func `overlapping token callers share one assertion mint`() async throws {
+    let store = InMemoryAppAttestStore()
+    try store.setKeyID(FakeAttestation.keyID, for: "clid_test")
+    let attestation = FakeAttestation()
+    let transport = MockTransport(responses: [
+      (200, WireFixtures.challengeBody),
+      (200, WireFixtures.oauthBody(token: "shared-token")),
+    ])
+    let session = makeSession(
+      store: store,
+      attestation: attestation,
+      transport: transport
+    )
+
+    let tokens = try await withThrowingTaskGroup(of: String.self, returning: [String].self) {
+      group in
+      for _ in 0..<8 {
+        group.addTask {
+          try await session.currentToken()
+        }
+      }
+      return try await group.reduce(into: []) { $0.append($1) }
+    }
+
+    #expect(Set(tokens) == Set(["shared-token"]))
+    #expect(attestation.assertionHashes.count == 1)
+    #expect(transport.requests.count == 2)
+  }
+
+  @Test func `cancelling registration clears ownership and permits retry`() async throws {
+    let store = InMemoryAppAttestStore()
+    let attestation = FakeAttestation()
+    let session = makeSession(
+      store: store,
       attestation: attestation,
       transport: MockTransport(status: 404, body: Data())
     )
 
-    await withTaskGroup(of: Void.self) { group in
-      for _ in 0..<8 {
-        group.addTask { try? await session.attestIfNeeded() }
+    let cancellationObserved = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
+      group.addTask {
+        do {
+          try await session.attestIfNeeded()
+          return false
+        } catch is CancellationError {
+          return true
+        } catch {
+          return false
+        }
       }
+      try? await Task.sleep(for: .milliseconds(10))
+      group.cancelAll()
+      return await group.reduce(false) { $0 || $1 }
     }
-    #expect(attestation.generateKeyCount == 1)
+
+    #expect(cancellationObserved)
+    #expect(try store.keyID(for: "clid_test") == nil)
+    await #expect(throws: AppAttestError.notYetAvailable) {
+      try await session.attestIfNeeded()
+    }
+    #expect(attestation.generateKeyCount == 2)
+  }
+
+  @Test func `cancellation after accepted registration preserves the credential`() async throws {
+    let store = InMemoryAppAttestStore()
+    let transport = CancellationReturningTransport(
+      gatedPath: "/v1/oauth/app-attest/register",
+      token: "registered-token"
+    )
+    let session = makeSession(store: store, transport: transport)
+
+    let cancellationObserved = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
+      group.addTask {
+        do {
+          _ = try await session.currentToken()
+          return false
+        } catch is CancellationError {
+          return true
+        } catch {
+          return false
+        }
+      }
+      await transport.waitUntilGatedRequestStarts()
+      group.cancelAll()
+      return await group.reduce(false) { $0 || $1 }
+    }
+
+    #expect(cancellationObserved)
+    #expect(try store.keyID(for: "clid_test") == FakeAttestation.keyID)
+    #expect(try store.token(for: "clid_test")?.value == "registered-token")
+    #expect(try await session.currentToken() == "registered-token")
+  }
+
+  @Test func `cancellation after successful mint preserves the token`() async throws {
+    let store = InMemoryAppAttestStore()
+    try store.setKeyID(FakeAttestation.keyID, for: "clid_test")
+    let transport = CancellationReturningTransport(
+      gatedPath: "/v1/oauth/token",
+      token: "minted-token"
+    )
+    let session = makeSession(store: store, transport: transport)
+
+    let cancellationObserved = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
+      group.addTask {
+        do {
+          _ = try await session.currentToken()
+          return false
+        } catch is CancellationError {
+          return true
+        } catch {
+          return false
+        }
+      }
+      await transport.waitUntilGatedRequestStarts()
+      group.cancelAll()
+      return await group.reduce(false) { $0 || $1 }
+    }
+
+    #expect(cancellationObserved)
+    #expect(try store.token(for: "clid_test")?.value == "minted-token")
+    #expect(try await session.currentToken() == "minted-token")
   }
 
   @Test func `form encoding percent-encodes reserved characters`() {
@@ -624,7 +754,7 @@ final class FakeAttestation: AttestationService {
   func generateKey() async throws -> String {
     state.withLock { $0.keys += 1 }
     // Suspends before returning, like the real seconds-long call.
-    try? await Task.sleep(for: .milliseconds(50))
+    try await Task.sleep(for: .milliseconds(50))
     return Self.keyID
   }
   func attestKey(_ keyID: String, clientDataHash: Data) async throws -> Data {
@@ -635,5 +765,75 @@ final class FakeAttestation: AttestationService {
     state.withLock { $0.assertions.append(clientDataHash) }
     if let assertionError { throw assertionError }
     return Self.assertionObject
+  }
+}
+
+private actor CancellationGate {
+  private var started = false
+
+  func markStarted() {
+    started = true
+  }
+
+  func waitUntilStarted() async {
+    while !started {
+      await Task.yield()
+    }
+  }
+}
+
+/// Returns a successful response after its caller is cancelled. This models a
+/// wire operation that the server completed just as local cancellation won.
+private final class CancellationReturningTransport: HTTPTransport {
+  private let gatedPath: String
+  private let token: String
+  private let gate = CancellationGate()
+
+  init(gatedPath: String, token: String) {
+    self.gatedPath = gatedPath
+    self.token = token
+  }
+
+  func waitUntilGatedRequestStarts() async {
+    await gate.waitUntilStarted()
+  }
+
+  func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+    let path = request.url?.path() ?? ""
+    let body: Data
+    if path == "/v1/oauth/app-attest/challenge" {
+      body = WireFixtures.challengeBody
+    } else if path == gatedPath {
+      await gate.markStarted()
+      do {
+        try await Task.sleep(for: .seconds(10))
+      } catch is CancellationError {
+        // The remote side already accepted the operation and its response is
+        // available, even though the local caller is now cancelled.
+      }
+      body = WireFixtures.oauthBody(token: token)
+    } else {
+      body = Data()
+    }
+    return (body, response(for: request))
+  }
+
+  func stream(
+    for request: URLRequest,
+    onResponse: (URLResponse) throws -> Void,
+    onChunk: (Data) async throws -> Void
+  ) async throws {
+    let (data, response) = try await data(for: request)
+    try onResponse(response)
+    try await onChunk(data)
+  }
+
+  private func response(for request: URLRequest) -> URLResponse {
+    HTTPURLResponse(
+      url: request.url!,
+      statusCode: 200,
+      httpVersion: "HTTP/1.1",
+      headerFields: [:]
+    )!
   }
 }
