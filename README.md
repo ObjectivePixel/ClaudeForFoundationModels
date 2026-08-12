@@ -160,11 +160,9 @@ ClaudeLanguageModel(
 `.appAttest` needs three things:
 
 - **A registered app.** Register the app's team ID and bundle ID in the
-  Anthropic console. The client ID it issues is public configuration that is
-  safe to include in the app binary. App registration is currently rolling
-  out and can be found
-  [here](https://platform.claude.com/settings/workspaces/default/app-integrations)
-  once available.
+  [Anthropic console](https://platform.claude.com/settings/workspaces/default/app-integrations).
+  The client ID it issues is public configuration that is safe to include in
+  the app binary.
 - **The App Attest capability.** Add the App Attest entitlement to the app
   (`com.apple.developer.devicecheck.appattest-environment`); this requires an
   explicitly registered App ID.
@@ -234,6 +232,24 @@ let model = ClaudeLanguageModel(
 ```
 
 `.webSearch` and `.webFetch` accept a `domains:` filter — `.unrestricted` (the default), `.allowing([...])`, or `.blocking([...])` — and an optional `maxUses`. These are distinct from the framework's `tools:` array, which holds client-side tools the framework invokes on the device.
+
+In the transcript, a response entry's segments run in the order the model produced them: prose in text segments and, wherever the model searched, fetched, or ran code, an empty segment holding that call's place. Ask the entry which it is to render the activity inline; a call appears as soon as the model issues it, with its `outcome` filled in when the result arrives in the same response:
+
+```swift
+for case .response(let entry) in session.transcript {
+  for segment in entry.segments {
+    if let activity = entry.claudeServerToolActivity(for: segment) {
+      if case .webSearch(let search) = activity.content { print("Searched for \(search.query)") }
+    } else if case .text(let text) = segment {
+      print(text.content)
+    }
+  }
+}
+```
+
+`session.transcript.claudeServerToolActivity` lists every round-trip in the conversation, and also pairs a result that only arrived in a later response (when the model called one of your tools alongside the search).
+
+Everything the API needs back on later turns (thinking signatures, search results, citations, a search that was still running when the model called one of your tools) is kept on the transcript entries under a reserved `claude.content` metadata key and replayed for you, including across a persisted `Transcript`. Treat that key's value as opaque.
 
 ## Error handling
 
